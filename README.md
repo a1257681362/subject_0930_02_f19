@@ -127,14 +127,15 @@
 
 - 设备档案（`POST /api/aqua/sensor/devices`）：按设备编码登记，绑定池塘与签名密钥；requestId 幂等，重复登记返回首条。
 - 批量上传（`POST /api/aqua/sensor/uploads`）：请求头 `X-Device-Code` / `X-Request-Id` / `X-Signature`，报文原文整体接收；**签名 = HMAC-SHA256(设备密钥, requestId + "\n" + 原始报文) 的十六进制串**。**签名失败或设备未登记的包整包隔离并保留原文**（`GET /api/aqua/sensor/quarantine` 可查原文与原因），绝不进入归并；退役设备上传直接拒绝。
-- 归并（按设备时间与序号）：读数以「设备 + 指标 + 设备时间 + 序号」为自然键去重——**同 requestId 整包重传返回首次结果；新 requestId 部分重叠只补缺失槽位**；归并时冻结当时规则版本与判定结论。
+- 归并（按池塘+设备时间+序号）：读数以「池塘 + 指标 + 设备时间 + 序号」为自然键去重（数据库唯一约束兜底并发与同包自重复）——**同 requestId 整包重传返回首次结果；新 requestId 部分重叠只补缺失槽位**；自然键不含物理设备，**设备更换后新设备携带同序号/同设备时间补传，沿更换关系仍识别为同一物理采样，绝不二次归并**；归并时冻结当时规则版本与判定结论。
 - 异常读数待复核（`GET /api/aqua/sensor/review-queue`）：超出规则正常范围的读数入队且**暂不计入日报**；`POST /review-queue/{id}/resolve` 复核——CONFIRMED 确认有效补入未审核日报，EXCLUDED 剔除永不计入；复核人与意见必填，同结论重复复核幂等。
-- 日报（`GET /api/aqua/sensor/daily-reports`）：按（池, 日, 指标）一行，统计（样本数/均值/最小/最大）**由归并读数重算得出，重新上传不会重复计入**；`POST /daily-reports/{id}/review` 审核后区间锁定（重复审核幂等）——**迟到数据只能补充未审核区间**，落入已审核区间的读数记 LATE_REJECTED 留痕且响应逐条说明，不入日报。
+- 日报（`GET /api/aqua/sensor/daily-reports`）：按（池, 日, 指标）一行，统计（样本数/均值/最小/最大）**由归并读数重算得出并在聚合链路再按自然键去重（双保险），重复/乱序/跨设备补传不会重复计入，溶氧最低值与采样次数不被放大**；跨日按半开区间 `[当日00:00, 次日00:00)` 归属；`POST /daily-reports/{id}/review` 审核后区间锁定（重复审核幂等）——**迟到数据只能补充未审核区间**，落入已审核区间的读数记 LATE_REJECTED 留痕且响应逐条说明，不入日报。日报首次建行即冻结归并规则版本：**即便离线归并规则先变更，既有日报仍按原冻结版本完成核对，不切换口径**，版本不一致只追加防护凭证。
 - 设备更换（`POST /api/aqua/sensor/devices/{id}/replace`）：原因与操作人必填，同一事务登记新设备、旧设备置 RETIRED、写新旧关联行；`GET /devices/{id}/lineage` 沿关联链双向追溯谱系；日报按池连续，换设备不断档。
 - 规则版本（`POST /api/aqua/sensor/rule-versions`）：盐度/溶氧/温度三组正常范围；**规则调整只能发布新版本（旧版本自动停用），已归并读数与日报冻结旧版本结论，绝不回改**。
-- 全程留证：设备登记/更换、规则版本发布与停用、上传归并、迟到拒绝、复核、日报审核、隔离均写 `t_sensor_change_evidence`（含操作前后快照与幂等请求号），可经 `GET /api/aqua/sensor/evidence` 按对象或 requestId 追溯。
+- 全程留证：设备登记/更换、规则版本发布与停用、上传归并、迟到拒绝、复核、日报审核、隔离均写 `t_sensor_change_evidence`（含操作前后快照与幂等请求号），可经 `GET /api/aqua/sensor/evidence` 按对象或 requestId 追溯。**异常/拦截只追加 WATCH_GUARD 凭证，绝不更新或覆盖既有凭证。**
+- 高风险观察台（`GET /api/aqua/sensor/risk-watch`，aqua-18）：海水养殖管理高风险观察项「传感器补传造成日报重复」持续观察——归并键规范化到池塘口径、日报同步限制（自然键去重、迟到只补未审核、隔离不进汇总、凭证只追加），观察台返回防护命中计数与最近记录。
 
-验收：`mvn test -Dtest=SensorIngestAcceptanceTest`，15 个检查点逐段输出报告，失败即停并给出停点。
+验收：`mvn test -Dtest=SensorIngestAcceptanceTest`，22 个检查点逐段输出报告（含乱序补传、同包槽位自重复、跨日边界、设备更换跨设备补传、规则先变更日报按原版本核对、隔离不入汇总、凭证只追加），失败即停并给出停点。
 
 ## 养殖成本分摊与批次结转（aqua-10）
 

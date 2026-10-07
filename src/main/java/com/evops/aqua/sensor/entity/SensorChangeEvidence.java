@@ -18,6 +18,7 @@ public class SensorChangeEvidence extends BaseEntity {
     public static final String ENTITY_REVIEW_TASK = "SENSOR_REVIEW_TASK";
     public static final String ENTITY_DAILY_REPORT = "SENSOR_DAILY_REPORT";
     public static final String ENTITY_QUARANTINE = "SENSOR_QUARANTINE";
+    public static final String ENTITY_RISK_WATCH = "SENSOR_RISK_WATCH";
 
     public static final String ACTION_CREATE = "CREATE";
     public static final String ACTION_UPDATE = "UPDATE";
@@ -31,6 +32,8 @@ public class SensorChangeEvidence extends BaseEntity {
     public static final String ACTION_EXCLUDE = "EXCLUDE";
     public static final String ACTION_REVIEW = "REVIEW";
     public static final String ACTION_RECALC = "RECALC";
+    /** 高风险观察项防护生效：补传重复槽位/隔离/迟到被拦截，只追加，不覆盖既有凭证。 */
+    public static final String ACTION_WATCH_GUARD = "WATCH_GUARD";
 
     private String entityType;
     private Long entityId;

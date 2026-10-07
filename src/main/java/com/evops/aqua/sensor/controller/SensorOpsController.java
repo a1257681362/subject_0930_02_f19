@@ -8,6 +8,7 @@ import com.evops.aqua.sensor.entity.SensorReviewTask;
 import com.evops.aqua.sensor.service.SensorDailyReportService;
 import com.evops.aqua.sensor.service.SensorEvidenceService;
 import com.evops.aqua.sensor.service.SensorReviewService;
+import com.evops.aqua.sensor.service.SensorRiskWatchService;
 import com.evops.common.ApiResponse;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.validation.annotation.Validated;
@@ -21,9 +22,10 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Map;
 
 /**
- * 传感器数据运营：异常读数待复核队列、日报审核、变更证据追溯。
+ * 传感器数据运营：异常读数待复核队列、日报审核、变更证据追溯、高风险观察台。
  */
 @RestController
 @RequestMapping("/api/aqua/sensor")
@@ -32,13 +34,16 @@ public class SensorOpsController {
     private final SensorReviewService reviewService;
     private final SensorDailyReportService dailyReportService;
     private final SensorEvidenceService evidenceService;
+    private final SensorRiskWatchService riskWatchService;
 
     public SensorOpsController(SensorReviewService reviewService,
                                SensorDailyReportService dailyReportService,
-                               SensorEvidenceService evidenceService) {
+                               SensorEvidenceService evidenceService,
+                               SensorRiskWatchService riskWatchService) {
         this.reviewService = reviewService;
         this.dailyReportService = dailyReportService;
         this.evidenceService = evidenceService;
+        this.riskWatchService = riskWatchService;
     }
 
     /** 异常读数待复核队列 */
@@ -77,5 +82,14 @@ public class SensorOpsController {
                                                             @RequestParam(required = false) Long entityId,
                                                             @RequestParam(required = false) String requestId) {
         return ApiResponse.ok(evidenceService.list(entityType, entityId, requestId));
+    }
+
+    /**
+     * 高风险观察台：海水养殖管理高风险观察项「传感器补传造成日报重复」及防护命中情况。
+     * 相关日报汇总已同步限制（自然键去重、迟到只补未审核、隔离不入汇总、凭证只追加）。
+     */
+    @GetMapping("/risk-watch")
+    public ApiResponse<List<Map<String, Object>>> riskWatch() {
+        return ApiResponse.ok(riskWatchService.watchItems());
     }
 }

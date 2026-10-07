@@ -14,6 +14,7 @@ import com.evops.aqua.sensor.mapper.SensorReadingMapper;
 import com.evops.aqua.sensor.mapper.SensorReviewTaskMapper;
 import com.evops.aqua.sensor.mapper.SensorUploadBatchMapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -33,10 +34,14 @@ import java.util.Set;
 /**
  * 设备离线批量上传归并（核心）：
  * 1) 验签——HMAC-SHA256(设备密钥, requestId + "\n" + 原始报文)，失败/未知设备整包隔离并保留原文；
- * 2) 归并——按（设备, 指标, 设备时间, 序号）自然键去重，重新上传以首次为准；
+ * 2) 归并——按（池塘, 指标, 设备时间, 序号）自然键去重。自然键不含物理设备：设备更换后
+ *    新设备携带同序号/同设备时间补传时，沿更换关系仍命中同一槽位，重新补传以首次为准；
+ *    数据库唯一约束对并发补传/同包槽位自重复兜底；
  * 3) 判定——按归并时生效规则版本判异常，异常读数进待复核队列暂不计入日报；
- * 4) 迟到——落入已审核日报区间的读数记 LATE_REJECTED 留痕，不补充进报；
- * 5) 日报——由归并读数重算得出，重复上传不重复计入。
+ * 4) 迟到——落入已审核日报区间的读数记 LATE_REJECTED 留痕，不补充进报；未审核区间照常补入；
+ * 5) 日报——由归并读数重算得出，重复上传（含跨设备、跨包、乱序补传）不重复计入；
+ * 6) 隔离——签名失败/未知设备整包隔离保留原文，绝不产生读数、绝不进入日报汇总；
+ * 7) 凭证——任何异常/拦截只追加 WATCH_GUARD 等证据，绝不覆盖既有凭证。
  * 整包按 requestId 幂等：重复上传返回首次归并结果。
  */
 @Service
@@ -50,6 +55,7 @@ public class SensorUploadService {
     private final SensorRuleVersionService ruleVersionService;
     private final SensorDailyReportService dailyReportService;
     private final SensorEvidenceService evidenceService;
+    private final SensorRiskWatchService riskWatchService;
     private final ObjectMapper objectMapper;
 
     public SensorUploadService(SensorUploadBatchMapper batchMapper,
@@ -60,6 +66,7 @@ public class SensorUploadService {
                                SensorRuleVersionService ruleVersionService,
                                SensorDailyReportService dailyReportService,
                                SensorEvidenceService evidenceService,
+                               SensorRiskWatchService riskWatchService,
                                ObjectMapper objectMapper) {
         this.batchMapper = batchMapper;
         this.readingMapper = readingMapper;
@@ -69,6 +76,7 @@ public class SensorUploadService {
         this.ruleVersionService = ruleVersionService;
         this.dailyReportService = dailyReportService;
         this.evidenceService = evidenceService;
+        this.riskWatchService = riskWatchService;
         this.objectMapper = objectMapper;
     }
 
@@ -92,6 +100,7 @@ public class SensorUploadService {
         SensorDevice device = deviceService.findByCode(deviceCode);
         if (device == null) {
             SensorQuarantine q = quarantine(deviceCode, requestId, signature, rawBody, "设备未登记：" + deviceCode);
+            watchQuarantine(requestId, q);
             return quarantineResult(q);
         }
         if (!SensorDevice.STATUS_ACTIVE.equals(device.getStatus())) {
@@ -100,6 +109,7 @@ public class SensorUploadService {
         if (!signatureOk(device.getSecretKey(), requestId, rawBody, signature)) {
             SensorQuarantine q = quarantine(deviceCode, requestId, signature, rawBody,
                     "签名校验失败，整包隔离");
+            watchQuarantine(requestId, q);
             return quarantineResult(q);
         }
 
@@ -109,6 +119,7 @@ public class SensorUploadService {
         } catch (Exception ex) {
             SensorQuarantine q = quarantine(deviceCode, requestId, signature, rawBody,
                     "报文解析失败：" + ex.getMessage());
+            watchQuarantine(requestId, q);
             return quarantineResult(q);
         }
         if (payload.getReadings() == null || payload.getReadings().isEmpty()) {
@@ -199,6 +210,10 @@ public class SensorUploadService {
     /**
      * 归并单条指标读数。返回 1 表示该指标参与了归并判定（计入 total），0 表示该指标缺项。
      * counts 依次累计：[0]新归并 [1]重复 [2]迟到拒绝 [3]异常待复核。
+     *
+     * 归并自然键为（池塘, 指标, 设备时间, 序号），故意不含物理设备：无论读数来自当前设备还是
+     * 更换前旧设备的补传，同一物理采样槽位只归并一次。除先查后插外，insert 再受数据库唯一
+     * 约束兜底——并发补传、同包槽位自重复命中约束时按重复处理，不抛出、不整包回滚、不重复计数。
      */
     private int mergeMetric(SensorUploadBatch batch, SensorDevice device,
                             UploadPayload.UploadReadingItem item, String metricType,
@@ -207,30 +222,32 @@ public class SensorUploadService {
         if (value == null) {
             return 0;
         }
-        Long exists = readingMapper.selectCount(new QueryWrapper<SensorReading>()
-                .eq("device_id", device.getId())
-                .eq("metric_type", metricType)
-                .eq("device_time", item.getDeviceTime())
-                .eq("seq_no", item.getSeqNo()));
-        if (exists != null && exists > 0) {
-            counts[1]++; // 重复槽位：以首次归并为准，不重复计入
+        Long pondId = device.getPondId();
+        if (slotExists(pondId, metricType, item.getDeviceTime(), item.getSeqNo())) {
+            counts[1]++; // 重复槽位：同请求号重传/新请求号补传/跨设备（更换）补传，均以首次归并为准
+            watchDuplicate(batch.getRequestId(), device, metricType, item, value, "归并前查重命中既有槽位");
             return 1;
         }
         LocalDate reportDate = item.getDeviceTime().toLocalDate();
         SensorReading reading = new SensorReading();
         reading.setBatchId(batch.getId());
         reading.setDeviceId(device.getId());
-        reading.setPondId(device.getPondId());
+        reading.setPondId(pondId);
         reading.setMetricType(metricType);
         reading.setDeviceTime(item.getDeviceTime());
         reading.setSeqNo(item.getSeqNo());
         reading.setReadingValue(value);
         reading.setRuleVersionId(ruleVersion.getId());
 
-        if (dailyReportService.isReviewed(device.getPondId(), reportDate, metricType)) {
-            // 迟到数据：已审核区间只能留痕，不能补充进报
+        if (dailyReportService.isReviewed(pondId, reportDate, metricType)) {
+            // 迟到数据：已审核区间只能留痕，不能补充进报；未审核区间在下方照常补入
             reading.setStatus(SensorReading.STATUS_LATE_REJECTED);
-            readingMapper.insert(reading);
+            if (!insertReadingAsDuplicate(reading)) {
+                counts[1]++; // 并发/跨设备补传抢先落了同一槽位：迟到留痕也不重复写
+                watchDuplicate(batch.getRequestId(), device, metricType, item, value,
+                        "已审核区间并发补传，唯一约束兜底判重");
+                return 1;
+            }
             counts[2]++;
             Map<String, Object> rejected = new LinkedHashMap<>();
             rejected.put("metricType", metricType);
@@ -240,23 +257,37 @@ public class SensorUploadService {
             lateRejectedItems.add(rejected);
             evidenceService.record(SensorChangeEvidence.ENTITY_READING, reading.getId(),
                     SensorChangeEvidence.ACTION_LATE_REJECT, batch.getRequestId(), null, reading,
-                    "迟到读数落入已审核区间，留痕但不入日报：" + metricType + " " + item.getDeviceTime());
+                    "迟到读数落入已审核区间，留痕但不入日报：" + metricType + " " + item.getDeviceTime()
+                            + " seq=" + item.getSeqNo());
+            riskWatchService.recordGuard(batch.getRequestId(), reading,
+                    "高风险观察项防护：迟到读数落入已审核（池,日,指标）区间，仅留痕不补入日报，防止补传放大"
+                            + reportDate + "「" + metricType + "」");
             return 1;
         }
 
         if (inRange(ruleVersion, metricType, value)) {
             reading.setStatus(SensorReading.STATUS_NORMAL);
-            readingMapper.insert(reading);
+            if (!insertReadingAsDuplicate(reading)) {
+                counts[1]++; // 唯一约束兜底：同槽位已归并，以首次为准
+                watchDuplicate(batch.getRequestId(), device, metricType, item, value,
+                        "正常值并发补传，唯一约束兜底判重");
+                return 1;
+            }
             counts[0]++;
         } else {
             // 异常读数：进待复核队列，暂不计入日报
             reading.setStatus(SensorReading.STATUS_ABNORMAL_PENDING);
-            readingMapper.insert(reading);
+            if (!insertReadingAsDuplicate(reading)) {
+                counts[1]++;
+                watchDuplicate(batch.getRequestId(), device, metricType, item, value,
+                        "异常值并发补传，唯一约束兜底判重");
+                return 1;
+            }
             counts[0]++;
             counts[3]++;
             SensorReviewTask task = new SensorReviewTask();
             task.setReadingId(reading.getId());
-            task.setPondId(device.getPondId());
+            task.setPondId(pondId);
             task.setMetricType(metricType);
             task.setDeviceTime(item.getDeviceTime());
             task.setReadingValue(value);
@@ -267,8 +298,50 @@ public class SensorUploadService {
                     "异常读数进待复核队列：" + metricType + "=" + value + " 超出规则版本["
                             + ruleVersion.getVersionNo() + "]正常范围");
         }
-        affectedDays.add(device.getPondId() + "|" + reportDate + "|" + metricType);
+        affectedDays.add(pondId + "|" + reportDate + "|" + metricType);
         return 1;
+    }
+
+    private boolean slotExists(Long pondId, String metricType, LocalDateTime deviceTime, Integer seqNo) {
+        Long exists = readingMapper.selectCount(new QueryWrapper<SensorReading>()
+                .eq("pond_id", pondId)
+                .eq("metric_type", metricType)
+                .eq("device_time", deviceTime)
+                .eq("seq_no", seqNo));
+        return exists != null && exists > 0;
+    }
+
+    /**
+     * 插入读数；唯一键（池塘,指标,设备时间,序号）冲突时返回 false，由调用方按重复槽位处理。
+     */
+    private boolean insertReadingAsDuplicate(SensorReading reading) {
+        try {
+            readingMapper.insert(reading);
+            return true;
+        } catch (DuplicateKeyException dup) {
+            return false;
+        }
+    }
+
+    private void watchDuplicate(String requestId, SensorDevice device, String metricType,
+                                UploadPayload.UploadReadingItem item, BigDecimal value, String phase) {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("pondId", device.getPondId());
+        snapshot.put("deviceId", device.getId());
+        snapshot.put("deviceCode", device.getDeviceCode());
+        snapshot.put("metricType", metricType);
+        snapshot.put("deviceTime", item.getDeviceTime().toString());
+        snapshot.put("seqNo", item.getSeqNo());
+        snapshot.put("readingValue", value);
+        riskWatchService.recordGuard(requestId, snapshot,
+                "高风险观察项防护：重复补传槽位（" + metricType + " " + item.getDeviceTime()
+                        + " seq=" + item.getSeqNo() + "）未二次归并、日报不重复计数——" + phase);
+    }
+
+    private void watchQuarantine(String requestId, SensorQuarantine quarantine) {
+        riskWatchService.recordGuard(requestId, quarantine,
+                "高风险观察项防护：整包隔离（" + quarantine.getReason()
+                        + "），隔离包不产生读数、不进入日报汇总");
     }
 
     private boolean inRange(SensorRuleVersion rule, String metricType, BigDecimal value) {
