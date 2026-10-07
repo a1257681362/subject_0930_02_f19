@@ -1,0 +1,56 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: evops-base
+  profiles:
+    active: dev
+  jackson:
+    time-zone: Asia/Shanghai
+    serialization:
+      write-dates-as-timestamps: false
+  datasource:
+    url: jdbc:h2:file:./data/evops;AUTO_SERVER=TRUE
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  h2:
+    console:
+      enabled: false
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+
+mybatis-plus:
+  mapper-locations: classpath*:mapper/**/*.xml
+  type-aliases-package: com.evops
+  configuration:
+    map-underscore-to-camel-case: true
+
+# 未使用 Shiro 注解鉴权（统一走 URL 过滤链）；关闭可避免其自动代理与事务代理叠加成 JDK 双重代理
+shiro:
+  annotations:
+    enabled: false
+
+# 渔获订单履约（aqua-14）：
+# gateway.mode=sim 时使用内存模拟海水养殖管理（默认，本地文件库环境不产生真实外呼）；
+# 切为 http 时按下方 url/超时真实投递，失败由发件箱扫描（outbox-scan-cron）补偿重发。
+aqua:
+  fulfill:
+    gateway:
+      mode: sim
+      http:
+        url: http://marine-manage.local/api/split-registrations
+        connect-timeout-ms: 3000
+        read-timeout-ms: 5000
+    outbox-scan-cron: "0 0/10 * * * ?"
+  # 水产监管月报（aqua-16）：每月 3 日 03:20 为上月各海区生成固化快照；
+  # 重新生成只产生新版本，失败任务保留异常链路等待 /api/aqua/report/jobs/{id}/retry。
+  report:
+    generate-scan-cron: "0 20 3 3 * ?"
+
+logging:
+  level:
+    com.evops: INFO
