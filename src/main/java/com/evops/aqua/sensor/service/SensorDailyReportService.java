@@ -17,8 +17,11 @@ import java.util.List;
 
 /**
  * 传感器日报：按（池, 日, 指标）一行，统计由归并读数重算得出——
- * 重新上传因读数自然键去重，不会重复计入日报。
+ * 归并自然键按池塘槽位去重，重新上传/换设备补传都不会重复计入日报。
  * OPEN 未审核可随补录重算；REVIEWED 已审核锁定，迟到数据一律拒绝补充。
+ * 日报一经建立即冻结规则版本：即便离线归并规则版本先发生变更，
+ * 后续重算仍按建报时的原版本核对，新版本只影响新建日报。
+ * 高风险观察期间未审核日报的汇总重算同步停止（独立事务留证后拒绝）。
  */
 @Service
 public class SensorDailyReportService {
@@ -26,18 +29,22 @@ public class SensorDailyReportService {
     private final SensorDailyReportMapper reportMapper;
     private final SensorReadingMapper readingMapper;
     private final SensorEvidenceService evidenceService;
+    private final SensorRiskWatchService riskWatchService;
 
     public SensorDailyReportService(SensorDailyReportMapper reportMapper,
                                     SensorReadingMapper readingMapper,
-                                    SensorEvidenceService evidenceService) {
+                                    SensorEvidenceService evidenceService,
+                                    SensorRiskWatchService riskWatchService) {
         this.reportMapper = reportMapper;
         this.readingMapper = readingMapper;
         this.evidenceService = evidenceService;
+        this.riskWatchService = riskWatchService;
     }
 
     /**
      * 重算某（池, 日, 指标）日报：统计口径为 NORMAL + 复核确认 CONFIRMED 的读数。
-     * 已 REVIEWED 的日报冻结不重算。首次归并该日时按当时规则版本建行。
+     * 已 REVIEWED 的日报冻结不重算（无需过观察闸门）。首次归并该日时按当时规则版本建行；
+     * 已存在的日报保留建报时冻结的规则版本，不因入参版本变更而换版核对。
      */
     @Transactional(rollbackFor = Exception.class)
     public SensorDailyReport recalc(Long pondId, LocalDate reportDate, String metricType,
@@ -46,6 +53,8 @@ public class SensorDailyReportService {
         if (report != null && isFrozen(report)) {
             return report;
         }
+        // 高风险观察闸门：未审核日报的汇总重算同步限制（REVIEWED 已在上方冻结返回）。
+        riskWatchService.requireAggregationAllowed(pondId, reportDate, metricType, requestId);
         List<SensorReading> counted = countedReadings(pondId, reportDate, metricType);
         SensorDailyReport before = report == null ? null : copyOf(report);
         if (report == null) {
@@ -59,16 +68,35 @@ public class SensorDailyReportService {
             reportMapper.insert(report);
             evidenceService.record(SensorChangeEvidence.ENTITY_DAILY_REPORT, report.getId(),
                     SensorChangeEvidence.ACTION_CREATE, requestId, null, report,
-                    "生成" + reportDate + "「" + metricType + "」日报，样本数=" + counted.size());
+                    "生成" + reportDate + "「" + metricType + "」日报，样本数=" + counted.size()
+                            + "，冻结规则版本id=" + ruleVersionId);
         } else {
             applyStats(report, counted);
             reportMapper.updateById(report);
             evidenceService.record(SensorChangeEvidence.ENTITY_DAILY_REPORT, report.getId(),
                     SensorChangeEvidence.ACTION_RECALC, requestId, before, report,
                     "重算" + reportDate + "「" + metricType + "」日报，样本数=" + counted.size()
-                            + "（重算自归并读数，重复上传不重复计入）");
+                            + "（重算自归并读数，重复/换设备补传不重复计入；按建报原规则版本id="
+                            + report.getRuleVersionId() + "核对，不随新版本换版）");
         }
         return report;
+    }
+
+    /**
+     * 解除高风险观察后的补算：把全部 OPEN 日报按各自冻结的原规则版本口径重算一遍，
+     * 使观察期间确认但未汇总的读数补入；REVIEWED 日报继续冻结不回改。
+     * 返回实际重算的日报条数。
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public int recalcAllOpenAfterWatchOff(String requestId) {
+        List<SensorDailyReport> openReports = reportMapper.selectList(new QueryWrapper<SensorDailyReport>()
+                .eq("status", SensorDailyReport.STATUS_OPEN)
+                .orderByAsc("report_date", "metric_type", "pond_id"));
+        for (SensorDailyReport open : openReports) {
+            recalc(open.getPondId(), open.getReportDate(), open.getMetricType(),
+                    open.getRuleVersionId(), requestId);
+        }
+        return openReports.size();
     }
 
     /**

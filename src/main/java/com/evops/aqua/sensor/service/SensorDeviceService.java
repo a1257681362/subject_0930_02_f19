@@ -172,6 +172,38 @@ public class SensorDeviceService {
         return result;
     }
 
+    /**
+     * 沿新旧关联链双向收集同谱系全部设备 id（含自身）。
+     * 归并去重用：设备更换后新设备补传旧槽位，必须与谱系内旧设备读数相互去重，
+     * 否则日报按池聚合时同一槽位会被新旧设备各计一次。
+     */
+    public java.util.Set<Long> lineageDeviceIds(Long deviceId) {
+        SensorDevice seed = getOrThrow(deviceId);
+        java.util.Set<Long> ids = new java.util.LinkedHashSet<>();
+        ids.add(seed.getId());
+        SensorDevice cursor = seed;
+        while (true) {
+            List<SensorDeviceSuccession> asNew = successionMapper.selectList(
+                    new QueryWrapper<SensorDeviceSuccession>().eq("new_device_id", cursor.getId()));
+            if (asNew.isEmpty()) {
+                break;
+            }
+            cursor = getOrThrow(asNew.get(0).getOldDeviceId());
+            ids.add(cursor.getId());
+        }
+        cursor = seed;
+        while (true) {
+            List<SensorDeviceSuccession> asOld = successionMapper.selectList(
+                    new QueryWrapper<SensorDeviceSuccession>().eq("old_device_id", cursor.getId()));
+            if (asOld.isEmpty()) {
+                break;
+            }
+            cursor = getOrThrow(asOld.get(0).getNewDeviceId());
+            ids.add(cursor.getId());
+        }
+        return ids;
+    }
+
     public SensorDevice getOrThrow(Long id) {
         SensorDevice device = deviceMapper.selectById(id);
         if (device == null) {

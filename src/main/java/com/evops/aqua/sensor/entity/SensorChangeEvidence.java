@@ -18,6 +18,7 @@ public class SensorChangeEvidence extends BaseEntity {
     public static final String ENTITY_REVIEW_TASK = "SENSOR_REVIEW_TASK";
     public static final String ENTITY_DAILY_REPORT = "SENSOR_DAILY_REPORT";
     public static final String ENTITY_QUARANTINE = "SENSOR_QUARANTINE";
+    public static final String ENTITY_RISK_WATCH = "SENSOR_RISK_WATCH";
 
     public static final String ACTION_CREATE = "CREATE";
     public static final String ACTION_UPDATE = "UPDATE";
@@ -31,6 +32,12 @@ public class SensorChangeEvidence extends BaseEntity {
     public static final String ACTION_EXCLUDE = "EXCLUDE";
     public static final String ACTION_REVIEW = "REVIEW";
     public static final String ACTION_RECALC = "RECALC";
+    /** 高风险观察：开始观察（限制离线归并与日报汇总） */
+    public static final String ACTION_WATCH_ON = "WATCH_ON";
+    /** 高风险观察：解除观察（恢复离线归并与日报汇总） */
+    public static final String ACTION_WATCH_OFF = "WATCH_OFF";
+    /** 高风险观察期间拒绝离线归并/日报汇总，独立事务留痕 */
+    public static final String ACTION_DENIED = "DENIED";
 
     private String entityType;
     private Long entityId;

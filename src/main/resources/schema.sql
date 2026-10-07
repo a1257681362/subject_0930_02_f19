@@ -1482,7 +1482,9 @@ CREATE TABLE IF NOT EXISTS t_sensor_upload_batch (
 );
 CREATE INDEX IF NOT EXISTS idx_sensor_batch_device ON t_sensor_upload_batch (device_id);
 
--- 归并读数：按（设备, 指标, 设备时间, 序号）自然键归并去重——重新上传同槽位读数以首次为准。
+-- 归并读数：按（池塘, 指标, 设备时间, 序号）自然键归并去重——
+-- 同一池塘内即便设备更换（新旧设备沿 succession 关联接续），同槽位补传仍以首次为准，
+-- 日报按（池, 日, 指标）聚合因此不会因换设备补传而重复计数。
 -- 状态：NORMAL 正常入报 / ABNORMAL_PENDING 异常待复核 / CONFIRMED 复核确认入报 /
 --       EXCLUDED 复核剔除 / LATE_REJECTED 迟到被拒（已审核区间，留痕不入报）。
 CREATE TABLE IF NOT EXISTS t_sensor_reading (
@@ -1500,7 +1502,7 @@ CREATE TABLE IF NOT EXISTS t_sensor_reading (
     create_time TIMESTAMP,
     update_by BIGINT,
     update_time TIMESTAMP,
-    CONSTRAINT uk_sensor_reading_slot UNIQUE (device_id, metric_type, device_time, seq_no)
+    CONSTRAINT uk_sensor_reading_slot UNIQUE (pond_id, metric_type, device_time, seq_no)
 );
 CREATE INDEX IF NOT EXISTS idx_sensor_reading_pond_date ON t_sensor_reading (pond_id, metric_type, device_time);
 
@@ -3203,3 +3205,40 @@ CREATE TABLE IF NOT EXISTS t_med_pond_mutex (
 MERGE INTO t_evops_schema_version (version_no, description)
 KEY (version_no)
 VALUES ('aqua-17', '用药领用休药期上下文隔离：休药结束日只取明细建单冻结快照并按池塘互斥串行重算、批号扣减条件更新防跨池并发超卖、多药叠加取最晚、历史审核结果不静默重算，撤回后可重提且领用编号/批次关联版本/时间逐版可辨');
+
+-- ============================================================
+-- aqua-18 离线归并高风险观察：传感器补传造成日报重复
+-- 1) 归并自然键由（设备, 指标, 设备时间, 序号）修正为（池塘, 指标, 设备时间, 序号），
+--    设备更换后新设备补传同槽位沿池塘谱系去重，日报按池聚合不再重复放大；
+-- 2) 高风险观察单行开关（id=1）：watch_enabled=1 期间离线补传归并与日报汇总重算同步限制，
+--    已审核日报与历史凭证一律冻结，仅允许查询/审核/留痕。
+-- 存量跨设备重复槽位即本缺陷产生的脏数据：先按池塘槽位去重（保留首次归并 min(id)），
+-- 旧设备级唯一键下同设备本无重复，故被清理行必然是换设备补传放大的重复计数。
+DELETE FROM t_sensor_reading WHERE id IN (
+    SELECT id FROM (
+        SELECT id, ROW_NUMBER() OVER (
+            PARTITION BY pond_id, metric_type, device_time, seq_no ORDER BY id) AS rn
+        FROM t_sensor_reading
+    ) WHERE rn > 1
+);
+ALTER TABLE t_sensor_reading DROP CONSTRAINT IF EXISTS uk_sensor_reading_slot;
+ALTER TABLE t_sensor_reading ADD CONSTRAINT uk_sensor_reading_slot
+    UNIQUE (pond_id, metric_type, device_time, seq_no);
+
+CREATE TABLE IF NOT EXISTS t_sensor_risk_watch (
+    id BIGINT PRIMARY KEY,
+    watch_subject VARCHAR(128) NOT NULL,
+    watch_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    changed_reason VARCHAR(500),
+    create_by BIGINT,
+    create_time TIMESTAMP,
+    update_by BIGINT,
+    update_time TIMESTAMP
+);
+MERGE INTO t_sensor_risk_watch (id, watch_subject, watch_enabled, changed_reason)
+KEY (id)
+VALUES (1, '传感器补传造成日报重复', FALSE, '初始未观察：允许离线归并与日报汇总');
+
+MERGE INTO t_evops_schema_version (version_no, description)
+KEY (version_no)
+VALUES ('aqua-18', '离线归并高风险观察：归并键修正为池塘级槽位（设备更换补传不重复计数），高风险观察期间离线补传归并与日报汇总重算同步限制，隔离包不入汇总，迟到数据只补未审核区间，日报按原规则版本核对，凭证只追加');

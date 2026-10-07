@@ -25,15 +25,18 @@ public class SensorReviewService {
     private final SensorReadingMapper readingMapper;
     private final SensorDailyReportService dailyReportService;
     private final SensorEvidenceService evidenceService;
+    private final SensorRiskWatchService riskWatchService;
 
     public SensorReviewService(SensorReviewTaskMapper reviewTaskMapper,
                                SensorReadingMapper readingMapper,
                                SensorDailyReportService dailyReportService,
-                               SensorEvidenceService evidenceService) {
+                               SensorEvidenceService evidenceService,
+                               SensorRiskWatchService riskWatchService) {
         this.reviewTaskMapper = reviewTaskMapper;
         this.readingMapper = readingMapper;
         this.dailyReportService = dailyReportService;
         this.evidenceService = evidenceService;
+        this.riskWatchService = riskWatchService;
     }
 
     /**
@@ -82,13 +85,19 @@ public class SensorReviewService {
                 "status=" + beforeReadingStatus, "status=" + readingStatus,
                 "复核结论同步读数状态：" + beforeReadingStatus + " → " + readingStatus);
 
-        // 确认有效才影响日报；且仅当日报未审核时重算补入，已审核日报冻结不回改
+        // 确认有效才影响日报；已审核日报冻结不回改；高风险观察期间日报汇总同步限制，
+        // 确认结论只留痕（读数已置 CONFIRMED），待解除观察后由日报补算统一计入。
         if (confirmed) {
             if (dailyReportService.isReviewed(reading.getPondId(),
                     reading.getDeviceTime().toLocalDate(), reading.getMetricType())) {
                 evidenceService.record(SensorChangeEvidence.ENTITY_READING, reading.getId(),
                         SensorChangeEvidence.ACTION_UPDATE, request.getRequestId(), null, null,
                         "日报已审核锁定，复核确认结论留痕但不回改日报");
+            } else if (riskWatchService.isRestricted()) {
+                evidenceService.record(SensorChangeEvidence.ENTITY_READING, reading.getId(),
+                        SensorChangeEvidence.ACTION_UPDATE, request.getRequestId(), null, null,
+                        "离线归并高风险观察（传感器补传造成日报重复）期间复核确认：结论留痕、读数置CONFIRMED，"
+                                + "日报汇总同步限制暂不重算，待解除观察后按日报原规则版本补算");
             } else {
                 dailyReportService.recalc(reading.getPondId(), reading.getDeviceTime().toLocalDate(),
                         reading.getMetricType(), reading.getRuleVersionId(), request.getRequestId());

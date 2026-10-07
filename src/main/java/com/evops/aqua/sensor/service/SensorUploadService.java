@@ -33,11 +33,15 @@ import java.util.Set;
 /**
  * 设备离线批量上传归并（核心）：
  * 1) 验签——HMAC-SHA256(设备密钥, requestId + "\n" + 原始报文)，失败/未知设备整包隔离并保留原文；
- * 2) 归并——按（设备, 指标, 设备时间, 序号）自然键去重，重新上传以首次为准；
+ * 2) 归并——按（池塘, 指标, 设备时间, 序号）自然键去重，重新上传以首次为准；
+ *    自然键按池塘而非设备：设备更换后新设备沿 succession 谱系接续同一池塘，
+ *    新设备补传旧槽位仍判重复，日报按（池,日,指标）聚合不会被补传放大；
  * 3) 判定——按归并时生效规则版本判异常，异常读数进待复核队列暂不计入日报；
- * 4) 迟到——落入已审核日报区间的读数记 LATE_REJECTED 留痕，不补充进报；
- * 5) 日报——由归并读数重算得出，重复上传不重复计入。
- * 整包按 requestId 幂等：重复上传返回首次归并结果。
+ * 4) 迟到——落入已审核日报区间的读数记 LATE_REJECTED 留痕，不补充进报；未审核区间可补入；
+ * 5) 日报——由归并读数重算得出，重复上传不重复计入；已建日报始终按其冻结的原规则版本核对；
+ * 6) 隔离——签名失败/未知设备/解析失败整包隔离，隔离包绝不归并、绝不进入日报汇总；
+ * 7) 高风险观察——观察「传感器补传造成日报重复」期间，新补传一律拒绝归并（独立事务留痕）。
+ * 整包按 requestId 幂等：重复上传返回首次归并结果（观察期间回放仍允许，不产生新数据）。
  */
 @Service
 public class SensorUploadService {
@@ -50,6 +54,7 @@ public class SensorUploadService {
     private final SensorRuleVersionService ruleVersionService;
     private final SensorDailyReportService dailyReportService;
     private final SensorEvidenceService evidenceService;
+    private final SensorRiskWatchService riskWatchService;
     private final ObjectMapper objectMapper;
 
     public SensorUploadService(SensorUploadBatchMapper batchMapper,
@@ -60,6 +65,7 @@ public class SensorUploadService {
                                SensorRuleVersionService ruleVersionService,
                                SensorDailyReportService dailyReportService,
                                SensorEvidenceService evidenceService,
+                               SensorRiskWatchService riskWatchService,
                                ObjectMapper objectMapper) {
         this.batchMapper = batchMapper;
         this.readingMapper = readingMapper;
@@ -69,6 +75,7 @@ public class SensorUploadService {
         this.ruleVersionService = ruleVersionService;
         this.dailyReportService = dailyReportService;
         this.evidenceService = evidenceService;
+        this.riskWatchService = riskWatchService;
         this.objectMapper = objectMapper;
     }
 
@@ -115,7 +122,14 @@ public class SensorUploadService {
             throw new IllegalArgumentException("上传报文不含任何采样记录");
         }
 
+        // 高风险观察闸门：观察「传感器补传造成日报重复」期间，新补传整包拒绝归并，
+        // 拒绝事实独立事务留痕（此前不落任何批次/读数行），日报汇总同步限制。
+        riskWatchService.requireMergeAllowed(deviceCode, requestId);
+
         SensorRuleVersion ruleVersion = ruleVersionService.requireActive();
+        // 沿设备更换谱系收集同池全部设备 id：归并自然键按池塘槽位去重，
+        // 新设备补传旧设备槽位必须判重，否则日报按池聚合会重复计数。
+        Set<Long> lineageDeviceIds = deviceService.lineageDeviceIds(device.getId());
         SensorUploadBatch batch = new SensorUploadBatch();
         batch.setRequestId(requestId);
         batch.setDeviceId(device.getId());
@@ -142,11 +156,11 @@ public class SensorUploadService {
             if (item.getDeviceTime() == null || item.getSeqNo() == null) {
                 throw new IllegalArgumentException("采样记录缺少设备时间或序号，整包拒绝");
             }
-            total += mergeMetric(batch, device, item, SensorReading.METRIC_SALINITY,
+            total += mergeMetric(batch, device, lineageDeviceIds, item, SensorReading.METRIC_SALINITY,
                     item.getSalinity(), ruleVersion, counts, lateRejectedItems, affectedDays);
-            total += mergeMetric(batch, device, item, SensorReading.METRIC_DO,
+            total += mergeMetric(batch, device, lineageDeviceIds, item, SensorReading.METRIC_DO,
                     item.getDissolvedOxygen(), ruleVersion, counts, lateRejectedItems, affectedDays);
-            total += mergeMetric(batch, device, item, SensorReading.METRIC_TEMP,
+            total += mergeMetric(batch, device, lineageDeviceIds, item, SensorReading.METRIC_TEMP,
                     item.getTemperature(), ruleVersion, counts, lateRejectedItems, affectedDays);
         }
         int merged = counts[0], duplicate = counts[1], lateRejected = counts[2], abnormal = counts[3];
@@ -199,8 +213,10 @@ public class SensorUploadService {
     /**
      * 归并单条指标读数。返回 1 表示该指标参与了归并判定（计入 total），0 表示该指标缺项。
      * counts 依次累计：[0]新归并 [1]重复 [2]迟到拒绝 [3]异常待复核。
+     * 归并自然键为池塘级槽位（pond_id, metric_type, device_time, seq_no）：
+     * 沿设备更换谱系匹配同槽位历史读数，换设备补传判重复，首次值为准。
      */
-    private int mergeMetric(SensorUploadBatch batch, SensorDevice device,
+    private int mergeMetric(SensorUploadBatch batch, SensorDevice device, Set<Long> lineageDeviceIds,
                             UploadPayload.UploadReadingItem item, String metricType,
                             BigDecimal value, SensorRuleVersion ruleVersion, int[] counts,
                             List<Map<String, Object>> lateRejectedItems, Set<String> affectedDays) {
@@ -208,7 +224,8 @@ public class SensorUploadService {
             return 0;
         }
         Long exists = readingMapper.selectCount(new QueryWrapper<SensorReading>()
-                .eq("device_id", device.getId())
+                .eq("pond_id", device.getPondId())
+                .in("device_id", lineageDeviceIds)
                 .eq("metric_type", metricType)
                 .eq("device_time", item.getDeviceTime())
                 .eq("seq_no", item.getSeqNo()));

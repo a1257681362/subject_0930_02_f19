@@ -127,14 +127,16 @@
 
 - 设备档案（`POST /api/aqua/sensor/devices`）：按设备编码登记，绑定池塘与签名密钥；requestId 幂等，重复登记返回首条。
 - 批量上传（`POST /api/aqua/sensor/uploads`）：请求头 `X-Device-Code` / `X-Request-Id` / `X-Signature`，报文原文整体接收；**签名 = HMAC-SHA256(设备密钥, requestId + "\n" + 原始报文) 的十六进制串**。**签名失败或设备未登记的包整包隔离并保留原文**（`GET /api/aqua/sensor/quarantine` 可查原文与原因），绝不进入归并；退役设备上传直接拒绝。
-- 归并（按设备时间与序号）：读数以「设备 + 指标 + 设备时间 + 序号」为自然键去重——**同 requestId 整包重传返回首次结果；新 requestId 部分重叠只补缺失槽位**；归并时冻结当时规则版本与判定结论。
+- 归并（按设备时间与序号）：读数以「**池塘** + 指标 + 设备时间 + 序号」为自然键去重——自然键按池塘而非设备：设备更换后新设备沿 succession 新旧关联谱系接续同一池塘，**新设备补传旧（时间,序号）槽位仍判重复、以首次归并为准**，日报按（池,日,指标）聚合因此不会被换设备补传放大（溶氧最低值/采样次数不重复）；**同 requestId 整包重传返回首次结果；新 requestId 部分重叠只补缺失槽位**；乱序上传（序号/时间倒置）与先后顺序无关，槽位去重同样生效；归并时冻结当时规则版本与判定结论。
+- 跨日边界：按设备时间半开区间 `[当日00:00, 次日00:00)` 归日，23:59 与次日 00:00 分属两张日报，端点不串日。
 - 异常读数待复核（`GET /api/aqua/sensor/review-queue`）：超出规则正常范围的读数入队且**暂不计入日报**；`POST /review-queue/{id}/resolve` 复核——CONFIRMED 确认有效补入未审核日报，EXCLUDED 剔除永不计入；复核人与意见必填，同结论重复复核幂等。
-- 日报（`GET /api/aqua/sensor/daily-reports`）：按（池, 日, 指标）一行，统计（样本数/均值/最小/最大）**由归并读数重算得出，重新上传不会重复计入**；`POST /daily-reports/{id}/review` 审核后区间锁定（重复审核幂等）——**迟到数据只能补充未审核区间**，落入已审核区间的读数记 LATE_REJECTED 留痕且响应逐条说明，不入日报。
-- 设备更换（`POST /api/aqua/sensor/devices/{id}/replace`）：原因与操作人必填，同一事务登记新设备、旧设备置 RETIRED、写新旧关联行；`GET /devices/{id}/lineage` 沿关联链双向追溯谱系；日报按池连续，换设备不断档。
+- 日报（`GET /api/aqua/sensor/daily-reports`）：按（池, 日, 指标）一行，统计（样本数/均值/最小/最大）**由归并读数重算得出，重新上传/换设备补传都不会重复计入**；日报一经建立即冻结规则版本，**即便离线归并规则版本先发生变更，已建日报仍按原版本核对**（新版本只影响之后新建日报）；`POST /daily-reports/{id}/review` 审核后区间锁定（重复审核幂等）——**迟到数据只能补充未审核区间**，落入已审核区间的读数记 LATE_REJECTED 留痕且响应逐条说明，不入日报。
+- 高风险观察（`POST /api/aqua/sensor/risk-watch/watch-on` / `/watch-off`，`GET` 查状态，原因必填）：观察项固定为「**传感器补传造成日报重复**」。置为观察后**离线补传归并停止受理（验签后的新补传整包 403 拒绝，读数不新增、批次不建立，拒绝事实以独立事务留痕），日报汇总重算同步限制**（观察期间复核 CONFIRMED 只把读数置 CONFIRMED 并留痕，日报暂不重算）；查询、日报审核、设备/版本档案维护不受影响，REVIEWED 日报与历史凭证始终冻结。解除观察时把观察期间挂起的全部 OPEN 日报按各自冻结的原规则版本统一补算（响应返回补算条数），REVIEWED 不回改。
+- 设备更换（`POST /api/aqua/sensor/devices/{id}/replace`）：原因与操作人必填，同一事务登记新设备、旧设备置 RETIRED、写新旧关联行；`GET /devices/{id}/lineage` 沿关联链双向追溯谱系；归并去重与日报按池连续，换设备补传旧槽位判重不断档也不重复。
 - 规则版本（`POST /api/aqua/sensor/rule-versions`）：盐度/溶氧/温度三组正常范围；**规则调整只能发布新版本（旧版本自动停用），已归并读数与日报冻结旧版本结论，绝不回改**。
-- 全程留证：设备登记/更换、规则版本发布与停用、上传归并、迟到拒绝、复核、日报审核、隔离均写 `t_sensor_change_evidence`（含操作前后快照与幂等请求号），可经 `GET /api/aqua/sensor/evidence` 按对象或 requestId 追溯。
+- 全程留证：设备登记/更换、规则版本发布与停用、上传归并、迟到拒绝、复核、日报审核、隔离、高风险观察切换与拒绝均写 `t_sensor_change_evidence`（含操作前后快照与幂等请求号），可经 `GET /api/aqua/sensor/evidence` 按对象或 requestId 追溯；**证据只追加，任何拒绝/异常路径都不更新或覆盖已有凭证**。
 
-验收：`mvn test -Dtest=SensorIngestAcceptanceTest`，15 个检查点逐段输出报告，失败即停并给出停点。
+验收：`mvn test -Dtest=SensorIngestAcceptanceTest`，15 个检查点逐段输出报告，失败即停并给出停点；补充回归 `mvn test -Dtest=SensorReorderRiskWatchAcceptanceTest`（乱序去重、跨日边界 23:59/00:00、设备更换后补传沿池塘谱系不重复、隔离包不入汇总、高风险观察离线归并与日报汇总同步限制及解除后按原版本补算、规则版本先变更日报仍按原版本核对、凭证只追加，9 个检查点）。
 
 ## 养殖成本分摊与批次结转（aqua-10）
 
